@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import StaticPool
 
 from app.schema import DocumentSchema
 
@@ -75,11 +76,26 @@ class DocumentNotFound(Exception):
 class SQLiteIndexStore:
     """Local SQLite store for documents, inverted index and metadata."""
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, schema: Optional[DocumentSchema] = None):
+    def __init__(
+        self,
+        db_path: str = DEFAULT_DB_PATH,
+        schema: Optional[DocumentSchema] = None,
+        engine: Optional[Engine] = None,
+    ):
         self.db_path = db_path
         if db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.engine: Engine = create_engine(f"sqlite:///{db_path}", future=True)
+        if engine is not None:
+            self.engine: Engine = engine
+        elif db_path == ":memory:":
+            self.engine = create_engine(
+                "sqlite://",
+                future=True,
+                poolclass=StaticPool,
+                connect_args={"check_same_thread": False},
+            )
+        else:
+            self.engine = create_engine(f"sqlite:///{db_path}", future=True, connect_args={"check_same_thread": False})
         self.schema: Optional[DocumentSchema] = None
         self._create_base_tables()
         if schema is not None:
@@ -161,6 +177,36 @@ class SQLiteIndexStore:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_postings_doc ON postings(doc_id)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_documents_created ON documents(created_at)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_unique_values_field ON unique_values(field_name)"))
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS quarantine (
+                        quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source        TEXT NOT NULL,
+                        line_number   INTEGER,
+                        raw_row       TEXT NOT NULL,
+                        errors        TEXT NOT NULL DEFAULT '[]',
+                        reason        TEXT NOT NULL,
+                        created_at    TEXT NOT NULL
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS ingestion_runs (
+                        run_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source     TEXT NOT NULL,
+                        format     TEXT NOT NULL,
+                        received   INTEGER NOT NULL,
+                        accepted   INTEGER NOT NULL,
+                        rejected   INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+            )
 
     def set_schema(self, schema: DocumentSchema) -> None:
         """Materialise the schema as columns on ``documents`` plus secondary indexes."""
@@ -297,6 +343,72 @@ class SQLiteIndexStore:
                 parts.append(normalize_text(validated.get(field.name)))
         return " ".join(parts)
 
+    # ---------------------------------------------------------------- quarantine
+    def add_quarantined_row(
+        self,
+        source: str,
+        line_number: Optional[int],
+        raw_row: Any,
+        errors: List[Dict[str, Any]],
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Persist a malformed ingestion row for later inspection."""
+        now = _now()
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "INSERT INTO quarantine (source, line_number, raw_row, errors, reason, created_at) "
+                    "VALUES (:source, :line, :raw, :errors, :reason, :created)"
+                ),
+                {
+                    "source": source,
+                    "line": line_number,
+                    "raw": json.dumps(raw_row, sort_keys=True, default=str),
+                    "errors": json.dumps(errors, sort_keys=True),
+                    "reason": reason,
+                    "created": now,
+                },
+            )
+        return {
+            "quarantine_id": result.lastrowid,
+            "source": source,
+            "line_number": line_number,
+            "reason": reason,
+            "errors": errors,
+        }
+
+    def list_quarantine(self, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT quarantine_id, source, line_number, raw_row, errors, reason, created_at "
+                    "FROM quarantine ORDER BY quarantine_id LIMIT :limit OFFSET :offset"
+                ),
+                {"limit": limit, "offset": offset},
+            ).fetchall()
+        return [
+            {
+                "quarantine_id": r[0],
+                "source": r[1],
+                "line_number": r[2],
+                "raw_row": json.loads(r[3]),
+                "errors": json.loads(r[4]),
+                "reason": r[5],
+                "created_at": r[6],
+            }
+            for r in rows
+        ]
+
+    def quarantine_count(self) -> int:
+        with self.engine.connect() as conn:
+            return conn.execute(text("SELECT COUNT(*) FROM quarantine")).scalar() or 0
+
+    def clear_quarantine(self) -> int:
+        with self.engine.begin() as conn:
+            count = conn.execute(text("SELECT COUNT(*) FROM quarantine")).scalar() or 0
+            conn.execute(text("DELETE FROM quarantine"))
+        return count
+
     # ---------------------------------------------------------------- reads
     def get_document(self, doc_id_or_external: Any) -> Dict[str, Any]:
         with self.engine.connect() as conn:
@@ -386,6 +498,33 @@ class SQLiteIndexStore:
         with self.engine.connect() as conn:
             names = [r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type IN ('table','index') ORDER BY name"))]
         return names
+
+    def record_ingestion_run(
+        self, source: str, fmt: str, received: int, accepted: int, rejected: int
+    ) -> Dict[str, Any]:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "INSERT INTO ingestion_runs (source, format, received, accepted, rejected, created_at) "
+                    "VALUES (:source, :format, :received, :accepted, :rejected, :created)"
+                ),
+                {
+                    "source": source,
+                    "format": fmt,
+                    "received": received,
+                    "accepted": accepted,
+                    "rejected": rejected,
+                    "created": _now(),
+                },
+            )
+        return {
+            "run_id": result.lastrowid,
+            "source": source,
+            "format": fmt,
+            "received": received,
+            "accepted": accepted,
+            "rejected": rejected,
+        }
 
     def bm25_stats(self) -> Dict[str, float]:
         with self.engine.connect() as conn:
