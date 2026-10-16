@@ -86,6 +86,12 @@ def compute_statistics(values: Iterable[Any], percentiles: Optional[List[float]]
 
 
 def _metric_sql(metric: str, column: str, percentile_value: Optional[float]) -> str:
+    """Return a SQLite expression for a metric.
+
+    ``percentile`` is approximated in SQL with AVG (the exact interpolated value
+    is computed separately from the group's value list), and ``median`` is the
+    50th percentile approximation.
+    """
     if metric in ("avg", "mean"):
         return f"AVG({column})"
     if metric == "count":
@@ -96,12 +102,7 @@ def _metric_sql(metric: str, column: str, percentile_value: Optional[float]) -> 
         return f"MIN({column})"
     if metric == "max":
         return f"MAX({column})"
-    if metric == "median":
-        return f"AVG({column})"
-    if metric == "percentile":
-        # SQLite has no native percentile; approximate with the closest rank
-        # using an ordered offset, then refine in Python for exactness.
-        p = DEFAULT_PERCENTILE if percentile_value is None else float(percentile_value)
+    if metric in ("median", "percentile"):
         return f"AVG({column})"
     raise AggregationError(f"unsupported metric {metric!r}; expected one of {sorted(AGGREGATION_METRICS)}")
 
