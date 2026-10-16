@@ -26,8 +26,8 @@ from typing import Any, Dict, List, Optional
 from app.aggregation import AggregationError, aggregate_documents
 from app.ingestion import IngestionError, IngestionPipeline
 from app.query import QueryError, execute_query
-from app.schema import ValidationError
-from app.storage import DocumentNotFound, IndexConflictError
+from app.schema import DocumentSchema, ValidationError, parse_schema
+from app.storage import DocumentNotFound, IndexConflictError, SQLiteIndexStore
 from app.state import AppState
 
 VALID_ACTIONS = {
@@ -116,6 +116,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _restore_schema(store: SQLiteIndexStore) -> Optional[DocumentSchema]:
+    """Re-materialise the persisted schema so each CLI invocation is standalone."""
+    with store.engine.connect() as conn:
+        from sqlalchemy import text
+
+        row = conn.execute(text("SELECT value FROM metadata WHERE key = 'schema'")).fetchone()
+    if not row:
+        return None
+    try:
+        schema = parse_schema(json.loads(row[0]))
+    except Exception:  # pragma: no cover - defensive against corrupt metadata
+        return None
+    store.set_schema(schema)
+    return schema
+
+
 def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> Dict[str, Any]:
     """Execute one CLI action and return the JSON-serialisable result payload."""
     if args.action not in VALID_ACTIONS:
@@ -124,6 +140,8 @@ def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> D
     owned_state = False
     if state is None:
         state = AppState(db_path=args.db)
+        if state.schema is None:
+            state.schema = _restore_schema(state.store)
         owned_state = True
     try:
         if args.action == "init-db":

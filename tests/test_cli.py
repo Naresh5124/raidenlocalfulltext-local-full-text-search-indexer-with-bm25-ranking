@@ -29,18 +29,21 @@ def parse(argv):
     return build_parser().parse_args(argv)
 
 
-def test_cli_init_and_schema():
-    state = AppState(db_path=":memory:")
-    result = run_command(parse(["--db", ":memory:", "set-schema", "--json", json.dumps(SCHEMA_PAYLOAD)]), state)
-    assert result["name"] == "article"
-    stats = run_command(parse(["--db", ":memory:", "stats"]), state)
+@pytest.fixture()
+def state():
+    s = AppState(db_path=":memory:")
+    s.set_schema(SCHEMA_PAYLOAD)
+    yield s
+    s.close()
+
+
+def test_cli_stats_reports_documents(state):
+    stats = run_command(parse(["stats"]), state)
     assert stats["documents"] == 0
-    state.close()
+    assert stats["terms"] == 0
 
 
-def test_cli_add_search_and_query():
-    state = AppState(db_path=":memory:")
-    run_command(parse(["set-schema", "--json", json.dumps(SCHEMA_PAYLOAD)]), state)
+def test_cli_add_search_and_query(state):
     for doc in DOCS:
         created = run_command(parse(["add", "--json", json.dumps(doc)]), state)
         assert created["external_id"] == doc["slug"]
@@ -49,12 +52,13 @@ def test_cli_add_search_and_query():
     assert search["results"][0]["external_id"] == "a3"
     query = run_command(parse(["query", "--filter", json.dumps({"field": "word_count", "op": "gte", "value": 20})]), state)
     assert query["total"] == 2
-    state.close()
+    sorted_query = run_command(parse(["query", "--filter", json.dumps({"field": "category", "op": "exists"}), "--sort", "created_at"]), state)
+    assert sorted_query["total"] == 3
+    assert len(sorted_query["results"]) == 3
+    assert sorted_query["sort"] == [{"field": "created_at", "direction": "desc"}]
 
 
-def test_cli_aggregate():
-    state = AppState(db_path=":memory:")
-    run_command(parse(["set-schema", "--json", json.dumps(SCHEMA_PAYLOAD)]), state)
+def test_cli_aggregate(state):
     for doc in DOCS:
         run_command(parse(["add", "--json", json.dumps(doc)]), state)
     result = run_command(
@@ -80,31 +84,65 @@ def test_cli_aggregate():
     assert search["metrics"]["sum"] == 50.0
     assert search["metrics"]["avg"] == 25.0
     assert search["metrics"]["percentiles"][25.0] == 17.5
+    assert search["metrics"]["percentiles"][75.0] == 32.5
+    assert search["metrics"]["median"] == 25.0
     assert result["total"]["statistics"]["count"] == 3
-    state.close()
+    assert result["total"]["statistics"]["min"] == 10.0
+    assert result["total"]["statistics"]["max"] == 40.0
 
 
-def test_cli_ingest_and_export(tmp_path):
-    state = AppState(db_path=":memory:")
-    run_command(parse(["set-schema", "--json", json.dumps(SCHEMA_PAYLOAD)]), state)
-    payload = "\n".join(json.dumps(doc) for doc in DOCS)
-    result = run_command(parse(["ingest", "--format", "jsonl", "--batch-size", "2"]), state) if False else None
-    # ingest reads from stdin; use the pipeline directly through run_command with a file
+def test_cli_aggregate_with_filter(state):
+    for doc in DOCS:
+        run_command(parse(["add", "--json", json.dumps(doc)]), state)
+    result = run_command(
+        parse(
+            [
+                "aggregate",
+                "--field",
+                "score",
+                "--metrics",
+                "count,sum,avg",
+                "--filter",
+                json.dumps({"field": "category", "op": "eq", "value": "index"}),
+            ]
+        ),
+        state,
+    )
+    assert result["group_count"] == 1
+    metrics = result["groups"][0]["metrics"]
+    assert metrics["count"] == 1
+    assert metrics["sum"] == 0.3
+    assert result["total"]["documents"] == 1
+
+
+def test_cli_ingest_and_export(state, tmp_path):
     file_path = tmp_path / "docs.jsonl"
-    file_path.write_text(payload, encoding="utf-8")
+    file_path.write_text("\n".join(json.dumps(doc) for doc in DOCS), encoding="utf-8")
     result = run_command(parse(["ingest", "--file", str(file_path), "--format", "jsonl", "--batch-size", "2"]), state)
     assert result["accepted"] == 3
     assert result["rejected"] == 0
+    assert result["backpressure"] is False
     export_path = tmp_path / "dump.json"
     export = run_command(parse(["export", "--file", str(export_path)]), state)
     assert export["count"] == 3
     written = json.loads(export_path.read_text(encoding="utf-8"))
     assert len(written["documents"]) == 3
-    state.close()
+
+
+def test_cli_requires_schema(state):
+    empty = AppState(db_path=":memory:")
+    try:
+        run_command(parse(["aggregate", "--field", "word_count"]), empty)
+    except ValueError as exc:
+        assert "schema" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("aggregate should require a schema")
+    finally:
+        empty.close()
 
 
 def test_cli_main_returns_error_code_for_bad_payload(capsys):
-    code = main(["--db", ":memory:", "query", "--filter", "{not json}"]) 
+    code = main(["--db", ":memory:", "query", "--filter", "{not json}"])
     assert code == 1
     captured = capsys.readouterr()
     assert "error" in captured.err
