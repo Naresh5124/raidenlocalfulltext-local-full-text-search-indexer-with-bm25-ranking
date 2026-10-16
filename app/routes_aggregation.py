@@ -8,8 +8,9 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.aggregation import AggregationError, aggregate_documents, compute_statistics, percentile
-from app.cli import run_command, build_parser
-from app.query import QueryError
+from app.cli import build_parser, run_command
+from app.query import QueryError, compile_filter
+from sqlalchemy import text
 from app.schema import ValidationError
 from app.state import AppState
 
@@ -107,23 +108,30 @@ def percentile_endpoint(
     state = _state()
     if state.schema is None:
         raise HTTPException(status_code=400, detail={"kind": "schema_missing", "message": "configure a schema before aggregating"})
+    filter_expression = None
+    if filter:
+        try:
+            filter_expression = json.loads(filter)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail={"kind": "query_error", "message": f"invalid filter JSON: {exc}"})
     try:
         result = aggregate_documents(
             state.store,
             state.schema,
             metrics=["percentile"],
             field=field,
-            filter_expression=json.loads(filter) if filter else None,
+            filter_expression=filter_expression,
             percentiles=[p],
         )
     except AggregationError as exc:
         raise HTTPException(status_code=400, detail={"kind": "aggregation_error", "message": str(exc)})
     except QueryError as exc:
         raise HTTPException(status_code=400, detail={"kind": "query_error", "message": str(exc)})
+    value_column = f"f_{field}" if state.schema.field(field) is not None else field
     values: List[float] = []
     with state.store.engine.connect() as conn:
-        where_sql, params = compile_filter(state.schema, json.loads(filter) if filter else None)
-        for row in conn.execute(text(f"SELECT f_{field} FROM documents WHERE {where_sql}"), params).fetchall():
+        where_sql, params = compile_filter(state.schema, filter_expression)
+        for row in conn.execute(text(f"SELECT {value_column} FROM documents WHERE {where_sql}"), params).fetchall():
             if row[0] is not None:
                 values.append(float(row[0]))
     return {"field": field, "percentile": p, "count": len(values), "value": percentile(values, p)}
