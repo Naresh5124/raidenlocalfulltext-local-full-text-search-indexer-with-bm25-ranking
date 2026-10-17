@@ -14,6 +14,8 @@ available programmatically and from a shell:
     python -m app.cli aggregate --field score --group-by tags --percentiles 25,75
     python -m app.cli stats
     python -m app.cli export --file dump.json
+    python -m app.cli export --format csv --file results.csv --query "bm25"
+    python -m app.cli export --format markdown --group-by category --field score
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from app.aggregation import AggregationError, aggregate_documents
+from app.export import ExportError, export_aggregation, export_documents, export_snapshot, write_export
 from app.ingestion import IngestionError, IngestionPipeline
 from app.query import QueryError, execute_query
 from app.schema import DocumentSchema, ValidationError, parse_schema
@@ -109,9 +112,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats_parser = subparsers.add_parser("stats", help="show index statistics")
 
-    export_parser = subparsers.add_parser("export", help="export indexed documents as JSON")
+    export_parser = subparsers.add_parser("export", help="export query results or index snapshots as JSON, CSV or Markdown")
     export_parser.add_argument("--file", default=None, help="output file (defaults to stdout)")
+    export_parser.add_argument("--format", default="json", choices=["json", "csv", "markdown"], help="report format")
     export_parser.add_argument("--limit", type=int, default=1000)
+    export_parser.add_argument("--offset", type=int, default=0)
+    export_parser.add_argument("--query", default=None, help="full-text query to restrict the export")
+    export_parser.add_argument("--filter", default=None, help="filter JSON expression")
+    export_parser.add_argument("--sort", default=None, help="comma separated sort fields")
+    export_parser.add_argument("--snapshot", action="store_true", help="export the whole index snapshot instead of query results")
+    export_parser.add_argument("--aggregate", action="store_true", help="export an aggregation rollup")
+    export_parser.add_argument("--field", default=None, help="numeric field to aggregate with --aggregate")
+    export_parser.add_argument("--metrics", default="count,sum,min,max,avg,percentile", help="metrics for --aggregate")
+    export_parser.add_argument("--group-by", default=None, help="comma separated grouping fields for --aggregate")
+    export_parser.add_argument("--percentiles", default="50", help="comma separated percentile levels")
 
     return parser
 
@@ -222,13 +236,49 @@ def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> D
             return state.store.stats()
 
         if args.action == "export":
-            documents = state.store.list_documents(limit=args.limit, offset=0)
-            payload = {"db_path": state.db_path, "count": len(documents), "documents": documents}
+            if args.snapshot:
+                result = export_snapshot(state.store, state.schema, fmt=args.format)
+            elif args.aggregate:
+                if state.schema is None:
+                    raise ValueError("configure a schema before aggregating")
+                metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
+                group_by = [g.strip() for g in args.group_by.split(",") if g.strip()] if args.group_by else []
+                percentiles = [float(p.strip()) for p in args.percentiles.split(",") if p.strip()]
+                filter_expression = json.loads(args.filter) if args.filter else None
+                result = export_aggregation(
+                    state.store,
+                    state.schema,
+                    fmt=args.format,
+                    field=args.field,
+                    metrics=metrics,
+                    group_by=group_by,
+                    filter_expression=filter_expression,
+                    percentiles=percentiles,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
+            else:
+                if state.schema is None:
+                    raise ValueError("configure a schema before exporting documents")
+                filter_expression = json.loads(args.filter) if args.filter else None
+                if args.query:
+                    filter_expression = {"term": args.query}
+                sort_spec = None
+                if args.sort:
+                    sort_spec = [{"field": part.strip(), "direction": "desc"} for part in args.sort.split(",") if part.strip()]
+                result = export_documents(
+                    state.store,
+                    state.schema,
+                    fmt=args.format,
+                    filter_expression=filter_expression,
+                    sort=sort_spec,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
             if args.file:
-                with open(args.file, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, indent=2, sort_keys=True, default=str)
-                return {"written": args.file, "count": len(documents)}
-            return payload
+                receipt = write_export(result["content"], args.file)
+                return {"format": result["format"], "row_count": result["row_count"], **receipt}
+            return {"format": result["format"], "row_count": result["row_count"], "content": result["content"]}
     finally:
         if owned_state:
             state.close()
@@ -239,7 +289,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = run_command(args)
-    except (ValidationError, IngestionError, QueryError, AggregationError, IndexConflictError, DocumentNotFound, ValueError, json.JSONDecodeError) as exc:
+    except (ValidationError, IngestionError, QueryError, AggregationError, ExportError, IndexConflictError, DocumentNotFound, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"error": type(exc).__name__, "message": str(exc)}), file=sys.stderr)
         return 1
     _print(result)
