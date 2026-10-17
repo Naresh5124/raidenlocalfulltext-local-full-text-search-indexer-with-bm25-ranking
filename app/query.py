@@ -86,19 +86,7 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
         params: Dict[str, Any] = {}
         for index, sub in enumerate(branches):
             sql, sub_params = compile_filter(schema, sub, f"{path}.{key}[{index}]")
-            clauses.append(f"({sql})")
-            for param_name, param_value in sub_params.items():
-                unique_name = f"{key}{index}_{param_name}"
-                params[unique_name] = param_value
-        # Rewrite the clause parameter names to the unique names.
-        for index, (sql, sub_params) in enumerate(zip(clauses, [compile_filter(schema, s, path)[1] for s in branches])):
-            pass
-        # Rebuild clauses with unique names by re-compiling with a prefix.
-        clauses = []
-        params = {}
-        for index, sub in enumerate(branches):
-            sql, sub_params = compile_filter(schema, sub, f"{path}.{key}[{index}]")
-            mapping = {}
+            mapping: Dict[str, str] = {}
             for param_name in sub_params:
                 unique_name = f"p{key}{index}_{param_name}"
                 mapping[param_name] = unique_name
@@ -107,7 +95,7 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
                 sql = sql.replace(f":{param_name}", f":{unique_name}")
             clauses.append(f"({sql})")
         joiner = " AND " if key == "and" else " OR "
-        return ("(" + joiner.join(clauses) + ")") if key == "or" else " ".join(clauses), params
+        return "(" + joiner.join(clauses) + ")", params
 
     if "not" in expression:
         sql, params = compile_filter(schema, expression["not"], f"{path}.not")
