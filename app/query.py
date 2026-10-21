@@ -9,6 +9,7 @@ Filter DSL
 - ``{"field": "title", "op": "eq", "value": "x"}``
 - ``{"field": "word_count", "op": "gte", "value": 10}``
 - ``{"field": "tags", "op": "contains", "value": "bm25"}``
+- ``{"field": "word_count", "op": "between", "value": [5, 10]}``
 - ``{"term": "search"}`` -> full-text term match against the inverted index
 - ``{"and": [...]}``, ``{"or": [...]}``, ``{"not": {...}}``
 - Bare shorthand: ``{"field": "title", "value": "x"}`` (op defaults to ``eq``)
@@ -33,7 +34,7 @@ COMPARISON_OPS = {
     "lte": "<=",
 }
 RANGE_OPS = {"gt", "gte", "lt", "lte"}
-ALLOWED_OPS = set(COMPARISON_OPS) | {"contains", "exists", "missing", "in", "match"}
+ALLOWED_OPS = set(COMPARISON_OPS) | {"contains", "exists", "missing", "in", "match", "between"}
 SORTABLE_SPECIAL = {"doc_id", "external_id", "created_at", "updated_at"}
 DEFAULT_SORT = "doc_id"
 
@@ -138,14 +139,22 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
     if op == "in":
         if not isinstance(value, list) or not value:
             raise QueryError(f"{path}.value must be a non-empty array for op 'in'")
-        placeholders = ", ".join(f"p_in_{i}" for i in range(len(value)))
-        return f"{column} IN ({placeholders})", {f"p_in_{i}": _sql_value(v) for i, v in enumerate(value)}
+        params = {f"p_in_{i}": _sql_value(v) for i, v in enumerate(value)}
+        placeholders = ", ".join(f":p_in_{i}" for i in range(len(value)))
+        return f"{column} IN ({placeholders})", params
     if op == "match":
         tokens = tokenize(str(value))
         if not tokens:
             raise QueryError(f"{path}.value must contain at least one token for op 'match'")
         placeholders = " || ".join(f":p_m_{i}" for i in range(len(tokens)))
         return f"{column} LIKE ({placeholders})", {f"p_m_{i}": f"%{t}%" for i, t in enumerate(tokens)}
+    if op == "between":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise QueryError(f"{path}.value must be a two-element array for op 'between'")
+        return (
+            f"{column} BETWEEN :p_low AND :p_high",
+            {"p_low": _sql_value(value[0]), "p_high": _sql_value(value[1])},
+        )
 
     if op in RANGE_OPS and value is None:
         raise QueryError(f"{path}.value is required for range operator {op!r}")
