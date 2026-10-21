@@ -31,6 +31,25 @@ class IngestionError(Exception):
     """Raised for payload-level ingestion problems (bad format, no header)."""
 
 
+def _normalize_payload(payload: Any) -> str:
+    """Return a plain text payload, unwrapping JSON-encoded strings."""
+    if payload is None:
+        return ""
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8")
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped.startswith('"') and stripped.endswith('"'):
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                return payload
+            if isinstance(decoded, str):
+                return decoded
+        return payload
+    return str(payload)
+
+
 def _looks_like_csv(text_payload: str) -> bool:
     """True when the payload reads as a CSV table (header + data rows)."""
     lines = [line for line in text_payload.splitlines() if line.strip()]
@@ -41,13 +60,37 @@ def _looks_like_csv(text_payload: str) -> bool:
         return False
     if "," not in header:
         return False
-    header_columns = len(next(csv.reader([header])))
+    try:
+        header_columns = len(next(csv.reader([header])))
+    except Exception:  # pragma: no cover - defensive
+        return False
     if header_columns < 2:
         return False
     for line in lines[1:]:
         if "{" in line or "[" in line:
             return False
         if "," not in line:
+            return False
+    return True
+
+
+def _is_jsonl(text_payload: str) -> bool:
+    """True when every non-empty line parses as a JSON object.
+
+    A payload made of a single JSON object on a single line is plain JSON, so
+    at least two object lines are required for JSONL detection.
+    """
+    lines = [line.strip() for line in text_payload.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    for line in lines:
+        if not line.startswith("{"):
+            return False
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(parsed, dict):
             return False
     return True
 
@@ -61,34 +104,21 @@ def _detect_format(payload: Any, fmt: Optional[str]) -> str:
 
     if isinstance(payload, (list, dict)):
         return "json"
-    if isinstance(payload, bytes):
-        payload = payload.decode("utf-8")
-    if not isinstance(payload, str):
-        raise IngestionError("payload must be a string, list or object")
 
-    stripped = payload.strip()
+    text = _normalize_payload(payload)
+    stripped = text.strip()
     if not stripped:
         return "json"
 
-    # A payload with multiple non-empty lines that are not a single JSON value
-    # (nor a CSV table) is treated as line-delimited JSON.
-    lines = [line for line in stripped.splitlines() if line.strip()]
-    if len(lines) > 1:
-        if _looks_like_csv(stripped):
-            return "csv"
-        try:
-            json.loads(stripped)
-            return "json"
-        except json.JSONDecodeError:
-            return "jsonl"
-
-    first = stripped[0]
-    if first in "[{":
-        try:
-            json.loads(stripped)
-            return "json"
-        except json.JSONDecodeError:
-            return "jsonl"
+    # Line-delimited JSON is detected first: each non-empty line is its own
+    # JSON object. Only payloads that parse as one JSON value count as JSON.
+    if _is_jsonl(stripped):
+        return "jsonl"
+    try:
+        json.loads(stripped)
+        return "json"
+    except json.JSONDecodeError:
+        pass
     if _looks_like_csv(stripped):
         return "csv"
     return "jsonl"
@@ -118,31 +148,49 @@ def _coerce_csv_value(value: Any) -> Any:
 
 
 def _csv_rows(text_payload: str) -> Iterator[Tuple[int, Any, List[Dict[str, Any]]]]:
-    reader = csv.DictReader(io.StringIO(text_payload))
+    """Yield ``(line_number, row, parse_errors)`` tuples for a CSV body."""
+    body = _normalize_payload(text_payload)
+    if not body:
+        return
+    if not body.endswith("\n"):
+        body += "\n"
+    reader = csv.DictReader(io.StringIO(body))
     if reader.fieldnames is None:
         raise IngestionError("CSV payload must contain a header row")
     header = [name for name in reader.fieldnames if name is not None]
-    for line_number, raw_row in enumerate(reader, start=2):
+    line_number = 1
+    for raw_row in reader:
+        line_number += 1
         values = list(raw_row.values())
         if len(values) != len(header):
-            yield line_number, dict(zip(header, values)), [
-                {"field": None, "code": "csv_column_count_mismatch", "message": "row has more columns than the header"}
-            ]
+            yield (
+                line_number,
+                dict(zip(header, values)),
+                [
+                    {
+                        "field": None,
+                        "code": "csv_column_count_mismatch",
+                        "message": "row has more columns than the header",
+                    }
+                ],
+            )
             continue
-        yield line_number, {name: _coerce_csv_value(value) for name, value in zip(header, values)}, []
+        yield (
+            line_number,
+            {name: _coerce_csv_value(value) for name, value in zip(header, values)},
+            [],
+        )
 
 
 def _read_rows(payload: Any, fmt: str) -> Iterator[Tuple[int, Any, List[Dict[str, Any]]]]:
     """Yield ``(line_number, row, parse_errors)`` tuples for the payload."""
-    if isinstance(payload, bytes):
-        payload = payload.decode("utf-8")
-
     if fmt == "json":
         if isinstance(payload, (list, dict)):
-            records = payload if isinstance(payload, list) else [payload]
+            records: List[Any] = payload if isinstance(payload, list) else [payload]
         else:
+            text = _normalize_payload(payload).strip()
             try:
-                parsed = json.loads(payload or "[]")
+                parsed = json.loads(text) if text else []
             except json.JSONDecodeError as exc:
                 raise IngestionError(f"invalid JSON payload: {exc}") from exc
             records = parsed if isinstance(parsed, list) else [parsed]
@@ -156,13 +204,15 @@ def _read_rows(payload: Any, fmt: str) -> Iterator[Tuple[int, Any, List[Dict[str
         return
 
     if fmt == "jsonl":
-        for line_number, line in enumerate((payload or "").splitlines(), start=1):
+        for line_number, line in enumerate(_normalize_payload(payload).splitlines(), start=1):
             if not line.strip():
                 continue
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
-                yield line_number, line, [{"field": None, "code": "invalid_json", "message": f"invalid JSON line: {exc}"}]
+                yield line_number, line, [
+                    {"field": None, "code": "invalid_json", "message": f"invalid JSON line: {exc}"}
+                ]
                 continue
             if isinstance(record, dict):
                 yield line_number, record, []
@@ -172,7 +222,12 @@ def _read_rows(payload: Any, fmt: str) -> Iterator[Tuple[int, Any, List[Dict[str
                 ]
         return
 
-    return _csv_rows(payload or "")
+    if fmt == "csv":
+        for item in _csv_rows(_normalize_payload(payload)):
+            yield item
+        return
+
+    raise IngestionError(f"unsupported format {fmt!r}")
 
 
 class IngestionPipeline:
@@ -196,6 +251,7 @@ class IngestionPipeline:
 
     def ingest(self, payload: Any, fmt: Optional[str] = None, source: str = "inline") -> Dict[str, Any]:
         detected = _detect_format(payload, fmt)
+        rows = list(_read_rows(payload, detected))
         accepted: List[Dict[str, Any]] = []
         rejected: List[Dict[str, Any]] = []
         batch: List[Tuple[int, Any]] = []
@@ -204,7 +260,7 @@ class IngestionPipeline:
         backpressure_triggered = False
         stopped_at: Optional[int] = None
 
-        for line_number, row, parse_errors in _read_rows(payload, detected):
+        for line_number, row, parse_errors in rows:
             if backpressure_triggered:
                 stopped_at = line_number
                 break
@@ -261,10 +317,11 @@ class IngestionPipeline:
         backpressure_triggered = False
         stopped_at: Optional[int] = None
 
+        joined = "\n".join(str(line) for line in lines)
         if fmt == "csv":
-            row_iter: Iterable[Tuple[int, Any, List[Dict[str, Any]]]] = _csv_rows("\n".join(lines))
+            row_iter: Iterable[Tuple[int, Any, List[Dict[str, Any]]]] = list(_csv_rows(joined))
         else:
-            row_iter = _read_rows("\n".join(lines), "jsonl")
+            row_iter = list(_read_rows(joined, "jsonl"))
 
         for line_number, row, parse_errors in row_iter:
             if backpressure_triggered:
