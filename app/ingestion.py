@@ -69,10 +69,21 @@ def _detect_format(payload: Any, fmt: Optional[str]) -> str:
     stripped = payload.strip()
     if not stripped:
         return "json"
+
+    # A payload with multiple non-empty lines that are not a single JSON value
+    # (nor a CSV table) is treated as line-delimited JSON.
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if len(lines) > 1:
+        if _looks_like_csv(stripped):
+            return "csv"
+        try:
+            json.loads(stripped)
+            return "json"
+        except json.JSONDecodeError:
+            return "jsonl"
+
     first = stripped[0]
-    if first == "[":
-        return "json"
-    if first == "{":
+    if first in "[{":
         try:
             json.loads(stripped)
             return "json"
@@ -80,9 +91,30 @@ def _detect_format(payload: Any, fmt: Optional[str]) -> str:
             return "jsonl"
     if _looks_like_csv(stripped):
         return "csv"
-    if "\n" in stripped or "," in stripped:
-        return "jsonl"
     return "jsonl"
+
+
+def _coerce_csv_value(value: Any) -> Any:
+    """Best-effort conversion of a raw CSV cell into a JSON-ish python value."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return ""
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    return text
 
 
 def _csv_rows(text_payload: str) -> Iterator[Tuple[int, Any, List[Dict[str, Any]]]]:
@@ -97,7 +129,7 @@ def _csv_rows(text_payload: str) -> Iterator[Tuple[int, Any, List[Dict[str, Any]
                 {"field": None, "code": "csv_column_count_mismatch", "message": "row has more columns than the header"}
             ]
             continue
-        yield line_number, {name: value for name, value in zip(header, values)}, []
+        yield line_number, {name: _coerce_csv_value(value) for name, value in zip(header, values)}, []
 
 
 def _read_rows(payload: Any, fmt: str) -> Iterator[Tuple[int, Any, List[Dict[str, Any]]]]:
@@ -233,8 +265,6 @@ class IngestionPipeline:
             row_iter: Iterable[Tuple[int, Any, List[Dict[str, Any]]]] = _csv_rows("\n".join(lines))
         else:
             row_iter = _read_rows("\n".join(lines), "jsonl")
-
-        row_iter = list(row_iter)
 
         for line_number, row, parse_errors in row_iter:
             if backpressure_triggered:

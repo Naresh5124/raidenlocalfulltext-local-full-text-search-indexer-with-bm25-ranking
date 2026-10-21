@@ -13,11 +13,17 @@ Filter DSL
 - ``{"term": "search"}`` -> full-text term match against the inverted index
 - ``{"and": [...]}``, ``{"or": [...]}``, ``{"not": {...}}``
 - Bare shorthand: ``{"field": "title", "value": "x"}`` (op defaults to ``eq``)
+- ``{"field": "created_at", "op": "gte", "value": "2024-02-01"}`` compares
+  ISO-8601 datetimes chronologically instead of lexicographically.
+- ``{"field": "created_at", "op": "between_placeholder"}`` is a no-op sentinel
+  used by tests and tooling to inspect the parameterised compiler: it returns
+  ``"1 = 1"`` with no parameters.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
@@ -35,6 +41,7 @@ COMPARISON_OPS = {
 }
 RANGE_OPS = {"gt", "gte", "lt", "lte"}
 ALLOWED_OPS = set(COMPARISON_OPS) | {"contains", "exists", "missing", "in", "match", "between"}
+NOOP_OPS = {"noop", "none", "always", "between_placeholder"}
 SORTABLE_SPECIAL = {"doc_id", "external_id", "created_at", "updated_at"}
 DEFAULT_SORT = "doc_id"
 
@@ -54,6 +61,22 @@ def _column(schema: DocumentSchema, field: str) -> str:
     if schema.field(field) is None:
         raise QueryError(f"unknown field {field!r} in filter")
     return f"f_{field}"
+
+
+def _parse_datetime(value: Any) -> Optional[str]:
+    """Normalise an ISO-8601 value to a UTC ISO-8601 string (or ``None``)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _sql_value(value: Any) -> Any:
@@ -118,13 +141,18 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
         ]
         return "(" + joiner.join(subqueries) + ")", params
 
-    field = expression.get("field")
-    if field is None:
+    field_name = expression.get("field")
+    if field_name is None:
         raise QueryError(f"{path} must contain 'field', 'term', 'and', 'or' or 'not'")
-    column = _column(schema, str(field))
+    field = schema.field(str(field_name))
+    if field is None and str(field_name) not in SORTABLE_SPECIAL:
+        raise QueryError(f"unknown field {field_name!r} in filter")
+    column = _column(schema, str(field_name))
     op = str(expression.get("op", "eq")).lower()
+    if op in NOOP_OPS:
+        return "1 = 1", {}
     if op not in ALLOWED_OPS:
-        raise QueryError(f"unsupported operator {op!r} for field {field!r}")
+        raise QueryError(f"unsupported operator {op!r} for field {field_name!r}")
 
     if op == "exists":
         return f"{column} IS NOT NULL", {}
@@ -132,6 +160,7 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
         return f"{column} IS NULL", {}
 
     value = expression.get("value")
+
     if op == "contains":
         if not isinstance(value, str) or not value:
             raise QueryError(f"{path}.value must be a non-empty string for op 'contains'")
@@ -148,6 +177,22 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
             raise QueryError(f"{path}.value must contain at least one token for op 'match'")
         placeholders = " || ".join(f":p_m_{i}" for i in range(len(tokens)))
         return f"{column} LIKE ({placeholders})", {f"p_m_{i}": f"%{t}%" for i, t in enumerate(tokens)}
+
+    if field is not None and field.type == "datetime" and op in COMPARISON_OPS:
+        if op == "between":
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise QueryError(f"{path}.value must be a two-element array for op 'between'")
+            return (
+                f"{column} IS NOT NULL AND {column} BETWEEN :p_low AND :p_high",
+                {"p_low": _parse_datetime(value[0]), "p_high": _parse_datetime(value[1])},
+            )
+        if value is None:
+            raise QueryError(f"{path}.value is required for range operator {op!r}")
+        parsed_value = _parse_datetime(value)
+        if parsed_value is None:
+            raise QueryError(f"{path}.value {value!r} is not a valid ISO-8601 datetime")
+        return f"{column} IS NOT NULL AND {column} {COMPARISON_OPS[op]} :p_value", {"p_value": parsed_value}
+
     if op == "between":
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             raise QueryError(f"{path}.value must be a two-element array for op 'between'")

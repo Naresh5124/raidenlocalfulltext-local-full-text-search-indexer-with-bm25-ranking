@@ -146,6 +146,27 @@ def _restore_schema(store: SQLiteIndexStore) -> Optional[DocumentSchema]:
     return schema
 
 
+def _export_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the CLI export receipt, including a ``documents`` list for tooling."""
+    snapshot = result.get("snapshot") or {}
+    rows = snapshot.get("rows")
+    if rows is None:
+        rows = snapshot.get("documents") or []
+    documents: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload") if isinstance(row, dict) else None
+        if isinstance(payload, dict):
+            documents.append(payload)
+        else:
+            documents.append(row)
+    return {
+        "format": result["format"],
+        "row_count": result["row_count"],
+        "count": result["row_count"],
+        "documents": documents,
+    }
+
+
 def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> Dict[str, Any]:
     """Execute one CLI action and return the JSON-serialisable result payload."""
     if args.action not in VALID_ACTIONS:
@@ -207,7 +228,7 @@ def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> D
         if args.action == "query":
             if state.schema is None:
                 raise ValueError("configure a schema before querying")
-            filter_expression = _load_json_argument(args.filter, None) if args.filter else None
+            filter_expression = json.loads(args.filter) if args.filter else None
             sort_spec = None
             if args.sort:
                 sort_spec = [{"field": part.strip(), "direction": "desc"} for part in args.sort.split(",") if part.strip()]
@@ -275,10 +296,14 @@ def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> D
                     limit=args.limit,
                     offset=args.offset,
                 )
+            receipt = _export_payload(result)
             if args.file:
-                receipt = write_export(result["content"], args.file)
-                return {"format": result["format"], "row_count": result["row_count"], **receipt}
-            return {"format": result["format"], "row_count": result["row_count"], "content": result["content"]}
+                try:
+                    write_receipt = write_export(result["content"], args.file)
+                except OSError as exc:
+                    raise ExportError(str(exc)) from exc
+                return {**receipt, **write_receipt}
+            return {**receipt, "content": result["content"]}
     finally:
         if owned_state:
             state.close()

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.ingestion import IngestionError, IngestionPipeline
 from app.query import QueryError, execute_query
-from app.schema import ValidationError
+from app.schema import FieldValidationError, ValidationError
 from app.storage import DocumentNotFound, IndexConflictError
 from app.state import AppState
 
@@ -78,10 +78,15 @@ def get_schema():
 def add_document(document: Dict[str, Any] = Body(...)):
     try:
         created = _state().store.add_document(document)
-    except ValidationError as exc:
+    except FieldValidationError as exc:
         raise HTTPException(
             status_code=422,
             detail={"kind": "schema_error", "message": str(exc), "errors": exc.errors},
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"kind": "schema_error", "message": str(exc), "errors": []},
         )
     except IndexConflictError as exc:
         raise HTTPException(status_code=409, detail={"kind": "conflict", "message": str(exc)})
@@ -102,10 +107,15 @@ def update_document(external_id: str, document: Dict[str, Any] = Body(...)):
         return _state().store.update_document(external_id, document)
     except DocumentNotFound:
         raise HTTPException(status_code=404, detail={"kind": "not_found", "message": f"document {external_id!r} not found"})
-    except ValidationError as exc:
+    except FieldValidationError as exc:
         raise HTTPException(
             status_code=422,
             detail={"kind": "schema_error", "message": str(exc), "errors": exc.errors},
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"kind": "schema_error", "message": str(exc), "errors": []},
         )
     except IndexConflictError as exc:
         raise HTTPException(status_code=409, detail={"kind": "conflict", "message": str(exc)})
@@ -143,7 +153,7 @@ def ingest(
 
 @router.post("/ingest/stream")
 def ingest_stream(
-    request: StreamRequest = Body(...),
+    request: Any = Body(...),
     format: Optional[str] = Query(None, description="jsonl | csv"),
     source: Optional[str] = Query(None),
     batch_size: Optional[int] = Query(None, ge=1, le=1000),
@@ -152,16 +162,38 @@ def ingest_stream(
     state = _state()
     if state.schema is None:
         raise HTTPException(status_code=400, detail={"kind": "schema_missing", "message": "configure a schema before ingesting documents"})
+
+    lines: List[str] = []
+    inline_batch_size: Optional[int] = None
+    inline_ratio: Optional[float] = None
+    inline_format: Optional[str] = None
+    inline_source: Optional[str] = None
+
+    if isinstance(request, list):
+        lines = [str(line) for line in request]
+    elif isinstance(request, dict):
+        try:
+            parsed = StreamRequest(**request)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise HTTPException(status_code=422, detail={"kind": "invalid_request", "message": str(exc)})
+        lines = parsed.resolved_lines()
+        inline_batch_size = parsed.batch_size
+        inline_ratio = parsed.max_quarantine_ratio
+        inline_format = parsed.format
+        inline_source = parsed.source
+    else:
+        raise HTTPException(status_code=422, detail={"kind": "invalid_request", "message": "stream body must be an array of lines or an object with 'lines'"})
+
     try:
         pipeline = _pipeline(
             state,
-            batch_size if batch_size is not None else request.batch_size,
-            max_quarantine_ratio if max_quarantine_ratio is not None else request.max_quarantine_ratio,
+            batch_size if batch_size is not None else inline_batch_size,
+            max_quarantine_ratio if max_quarantine_ratio is not None else inline_ratio,
         )
         return pipeline.ingest_stream(
-            request.resolved_lines(),
-            fmt=format or request.format or "jsonl",
-            source=source or request.source or "stream",
+            lines,
+            fmt=format or inline_format or "jsonl",
+            source=source or inline_source or "stream",
         )
     except IngestionError as exc:
         raise HTTPException(status_code=400, detail={"kind": "ingestion_error", "message": str(exc)})

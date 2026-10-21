@@ -83,11 +83,11 @@ class SQLiteIndexStore:
         engine: Optional[Engine] = None,
     ):
         self.db_path = db_path
-        if db_path != ":memory:":
+        if db_path != ":memory:" and db_path != "":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         if engine is not None:
             self.engine: Engine = engine
-        elif db_path == ":memory:":
+        elif db_path == ":memory:" or db_path == "":
             self.engine = create_engine(
                 "sqlite://",
                 future=True,
@@ -241,7 +241,12 @@ class SQLiteIndexStore:
         pk = self.schema.primary_key_field.name
         external_id = str(validated[pk])
         now = _now()
-        columns = {"external_id": external_id, "payload": json.dumps(validated, sort_keys=True), "created_at": now, "updated_at": now}
+        columns = {
+            "external_id": external_id,
+            "payload": json.dumps(validated, sort_keys=True),
+            "created_at": now,
+            "updated_at": now,
+        }
         for field in self.schema.fields:
             columns[f"f_{field.name}"] = _encode(field, validated.get(field.name))
         body_text = self._document_text(validated)
