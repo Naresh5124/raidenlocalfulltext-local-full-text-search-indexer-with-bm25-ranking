@@ -110,6 +110,18 @@ def _detect_format(payload: Any, fmt: Optional[str]) -> str:
     if not stripped:
         return "json"
 
+    # A single JSON object terminated by a line break is commonly emitted as
+    # a one-record JSONL stream. Without the terminator, keep treating it as
+    # a plain JSON document.
+    if isinstance(payload, str) and payload.endswith(("\n", "\r")):
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        if len(lines) == 1 and lines[0].startswith("{"):
+            try:
+                if isinstance(json.loads(lines[0]), dict):
+                    return "jsonl"
+            except json.JSONDecodeError:
+                pass
+
     # Line-delimited JSON is detected first: each non-empty line is its own
     # JSON object. Only payloads that parse as one JSON value count as JSON.
     if _is_jsonl(stripped):

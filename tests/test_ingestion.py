@@ -128,7 +128,7 @@ def test_backpressure_flag_not_triggered_when_clean(pipeline):
 
 
 def test_quarantine_persisted_and_cleared(pipeline):
-    pipeline.ingest("{bad json\n{\"slug\": \"q1\", \"title\": \"ok\", \"body\": \"b\"}", fmt="jsonl")
+    pipeline.ingest("{bad json\n{\"slug\": \"q1\", \"title\": \"Valid title\", \"body\": \"b\"}", fmt="jsonl")
     assert pipeline.store.quarantine_count() == 1
     removed = pipeline.store.clear_quarantine()
     assert removed == 1

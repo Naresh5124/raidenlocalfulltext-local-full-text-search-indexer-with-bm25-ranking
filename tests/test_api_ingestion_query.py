@@ -35,7 +35,7 @@ def fresh_state():
 
 def test_set_and_get_schema(fresh_state):
     response = client.get("/schema")
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["name"] == "article"
     assert payload["primary_key"] == "slug"
@@ -54,12 +54,12 @@ def test_ingest_json_batch_and_query(fresh_state):
         {"slug": "a2", "title": "Inverted index", "body": "terms to documents", "tags": ["index"], "word_count": 4},
     ]
     response = client.post("/ingest?format=json", json=payload)
-    assert response.status_code == 200
+    assert response.status_code == 200,response.text
     result = response.json()
     assert result["accepted"] == 2 and result["rejected"] == 0
 
     query = client.post("/query", json={"filter": {"field": "word_count", "op": "gte", "value": 4}, "sort": [{"field": "word_count", "direction": "desc"}]})
-    assert query.status_code == 200
+    assert query.status_code == 200,query.text
     body = query.json()
     assert body["total"] == 1
     assert body["results"][0]["external_id"] == "a2"
@@ -72,7 +72,7 @@ def test_ingest_jsonl_quarantine_and_list(fresh_state):
         '{"slug": "b2", "body": "no title"}',
     ]
     response = client.post("/ingest?format=jsonl", json="\n".join(lines))
-    assert response.status_code == 200
+    assert response.status_code == 200,response.text
     body = response.json()
     assert body["accepted"] == 1 and body["rejected"] == 2 and body["backpressure"] is True
 
@@ -87,7 +87,7 @@ def test_ingest_jsonl_quarantine_and_list(fresh_state):
 def test_ingest_csv(fresh_state):
     csv_payload = "slug,title,body,word_count\nc1,CSV row,hello,5\nc2,Another row,world,2\n"
     response = client.post("/ingest", json=csv_payload)
-    assert response.status_code == 200
+    assert response.status_code == 200,response.text
     body = response.json()
     assert body["format"] == "csv" and body["accepted"] == 2
 
@@ -98,7 +98,7 @@ def test_stream_endpoint(fresh_state):
         '{"slug": "s2", "title": "Streamed two", "body": "two"}',
     ]
     response = client.post("/ingest/stream?format=jsonl", json=lines)
-    assert response.status_code == 200
+    assert response.status_code == 200,response.text
     assert response.json()["accepted"] == 2
 
 

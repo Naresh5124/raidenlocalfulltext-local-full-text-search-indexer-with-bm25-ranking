@@ -26,7 +26,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from app.aggregation import AggregationError, aggregate_documents
-from app.export import ExportError, export_aggregation, export_documents, export_snapshot, write_export
+from app.export import ExportError, export_aggregation, export_documents, export_snapshot, render_json, write_export
 from app.ingestion import IngestionError, IngestionPipeline
 from app.query import QueryError, execute_query
 from app.schema import DocumentSchema, ValidationError, parse_schema
@@ -299,7 +299,10 @@ def run_command(args: argparse.Namespace, state: Optional[AppState] = None) -> D
             receipt = _export_payload(result)
             if args.file:
                 try:
-                    write_receipt = write_export(result["content"], args.file)
+                    content = result["content"]
+                    if args.format == "json" and "snapshot" in result:
+                        content = render_json({**result["snapshot"], "documents": receipt["documents"]})
+                    write_receipt = write_export(content, args.file)
                 except OSError as exc:
                     raise ExportError(str(exc)) from exc
                 return {**receipt, **write_receipt}

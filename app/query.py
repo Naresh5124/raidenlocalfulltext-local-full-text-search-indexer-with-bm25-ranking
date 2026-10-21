@@ -56,11 +56,11 @@ class QueryError(Exception):
 
 
 def _column(schema: DocumentSchema, field: str) -> str:
+    if schema.field(field) is not None:
+        return f"f_{field}"
     if field in SORTABLE_SPECIAL:
         return field
-    if schema.field(field) is None:
-        raise QueryError(f"unknown field {field!r} in filter")
-    return f"f_{field}"
+    raise QueryError(f"unknown field {field!r} in filter")
 
 
 def _parse_datetime(value: Any) -> Optional[str]:
@@ -206,21 +206,41 @@ def compile_filter(schema: DocumentSchema, expression: Any, path: str = "filter"
     return f"{column} {COMPARISON_OPS[op]} :p_value", {"p_value": _sql_value(value)}
 
 
-def compile_sort(sort: Optional[List[Dict[str, Any]]]) -> str:
-    """Compile ``[{"field": ..., "direction": "asc|desc"}]`` into an ORDER BY clause."""
+
+def compile_sort(
+    sort: Optional[List[Dict[str, Any]]],
+    schema: Optional[DocumentSchema] = None,
+) -> str:
+    """Compile sort specifications into a safe SQL ORDER BY clause."""
     if not sort:
         return f"{DEFAULT_SORT} ASC"
+
     parts: List[str] = []
+
     for entry in sort:
         if not isinstance(entry, dict) or "field" not in entry:
             raise QueryError("sort entries must be objects with a 'field' key")
+
         field = str(entry["field"])
-        if field not in SORTABLE_SPECIAL:
+
+        if schema is not None and schema.field(field) is not None:
+            column = f"f_{field}"
+        elif field in SORTABLE_SPECIAL:
+            column = field
+        else:
             raise QueryError(f"cannot sort on unknown field {field!r}")
+
         direction = str(entry.get("direction", "asc")).lower()
         if direction not in {"asc", "desc"}:
-            raise QueryError(f"sort direction must be 'asc' or 'desc', got {direction!r}")
-        parts.append(f"{field} {direction.upper()}")
+            raise QueryError(
+                f"sort direction must be 'asc' or 'desc', got {direction!r}"
+            )
+
+        # Keep null schema values after populated values in either direction.
+        if schema is not None and schema.field(field) is not None:
+            parts.append(f"({column} IS NULL) ASC")
+        parts.append(f"{column} {direction.upper()}")
+
     return ", ".join(parts)
 
 
@@ -239,7 +259,7 @@ def execute_query(
         raise QueryError("offset must be >= 0")
 
     where_sql, params = compile_filter(schema, filter_expression)
-    order_sql = compile_sort(sort)
+    order_sql = compile_sort(sort, schema)
 
     select_columns = ["doc_id", "external_id", "payload", "body_text", "created_at", "updated_at"]
     for field in schema.fields:

@@ -188,7 +188,6 @@ def build_query_snapshot(
     rows = [_flatten_row(record) for record in result["results"]]
     snapshot: Dict[str, Any] = {
         "kind": "query_snapshot",
-        "generated_at": _now(),
         "schema_name": schema.name,
         "schema_version": schema.version,
         "filter": filter_expression,
@@ -288,7 +287,6 @@ def export_documents(
                 "title": "Summary",
                 "lines": [
                     f"Schema: {snapshot['schema_name']} (v{snapshot['schema_version']})",
-                    f"Generated: {snapshot['generated_at']}",
                     f"Matching documents: {snapshot['total']}",
                     f"Returned rows: {snapshot['returned']} (limit {snapshot['limit']}, offset {snapshot['offset']})",
                     f"Filter: {json.dumps(snapshot['filter'], sort_keys=True, default=str)}",
