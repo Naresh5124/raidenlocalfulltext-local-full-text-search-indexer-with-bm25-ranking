@@ -31,6 +31,27 @@ class IngestionError(Exception):
     """Raised for payload-level ingestion problems (bad format, no header)."""
 
 
+def _looks_like_csv(text_payload: str) -> bool:
+    """True when the payload reads as a CSV table (header + data rows)."""
+    lines = [line for line in text_payload.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    header = lines[0]
+    if "{" in header or "[" in header:
+        return False
+    if "," not in header:
+        return False
+    header_columns = len(next(csv.reader([header])))
+    if header_columns < 2:
+        return False
+    for line in lines[1:]:
+        if "{" in line or "[" in line:
+            return False
+        if "," not in line:
+            return False
+    return True
+
+
 def _detect_format(payload: Any, fmt: Optional[str]) -> str:
     if fmt is not None:
         fmt = fmt.lower()
@@ -57,10 +78,10 @@ def _detect_format(payload: Any, fmt: Optional[str]) -> str:
             return "json"
         except json.JSONDecodeError:
             return "jsonl"
-    if "\n" in stripped:
+    if _looks_like_csv(stripped):
         return "csv"
-    if "," in stripped:
-        return "csv"
+    if "\n" in stripped or "," in stripped:
+        return "jsonl"
     return "jsonl"
 
 
