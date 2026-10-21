@@ -26,13 +26,20 @@ class QueryRequest(BaseModel):
 
 
 class StreamRequest(BaseModel):
-    """Body schema for the streaming ingestion endpoint."""
+    """Body schema for the streaming ingestion endpoint.
 
-    lines: List[str]
+    Accepts either ``lines`` (an array of raw lines) or a bare JSON array of
+    lines posted directly as the request body.
+    """
+
+    lines: Optional[List[str]] = None
     format: Optional[str] = None
     source: Optional[str] = None
     batch_size: Optional[int] = Field(None, ge=1, le=1000)
     max_quarantine_ratio: Optional[float] = Field(None, ge=0.0, le=1.0)
+
+    def resolved_lines(self) -> List[str]:
+        return self.lines or []
 
 
 def _state() -> AppState:
@@ -72,7 +79,10 @@ def add_document(document: Dict[str, Any] = Body(...)):
     try:
         created = _state().store.add_document(document)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail={"kind": "schema_error", "message": str(exc)})
+        raise HTTPException(
+            status_code=422,
+            detail={"kind": "schema_error", "message": str(exc), "errors": exc.errors},
+        )
     except IndexConflictError as exc:
         raise HTTPException(status_code=409, detail={"kind": "conflict", "message": str(exc)})
     return created
@@ -93,7 +103,10 @@ def update_document(external_id: str, document: Dict[str, Any] = Body(...)):
     except DocumentNotFound:
         raise HTTPException(status_code=404, detail={"kind": "not_found", "message": f"document {external_id!r} not found"})
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail={"kind": "schema_error", "message": str(exc)})
+        raise HTTPException(
+            status_code=422,
+            detail={"kind": "schema_error", "message": str(exc), "errors": exc.errors},
+        )
     except IndexConflictError as exc:
         raise HTTPException(status_code=409, detail={"kind": "conflict", "message": str(exc)})
 
@@ -130,7 +143,7 @@ def ingest(
 
 @router.post("/ingest/stream")
 def ingest_stream(
-    request: StreamRequest,
+    request: StreamRequest = Body(...),
     format: Optional[str] = Query(None, description="jsonl | csv"),
     source: Optional[str] = Query(None),
     batch_size: Optional[int] = Query(None, ge=1, le=1000),
@@ -140,8 +153,16 @@ def ingest_stream(
     if state.schema is None:
         raise HTTPException(status_code=400, detail={"kind": "schema_missing", "message": "configure a schema before ingesting documents"})
     try:
-        pipeline = _pipeline(state, batch_size or request.batch_size, max_quarantine_ratio if max_quarantine_ratio is not None else request.max_quarantine_ratio)
-        return pipeline.ingest_stream(request.lines, fmt=format or request.format or "jsonl", source=source or request.source or "stream")
+        pipeline = _pipeline(
+            state,
+            batch_size if batch_size is not None else request.batch_size,
+            max_quarantine_ratio if max_quarantine_ratio is not None else request.max_quarantine_ratio,
+        )
+        return pipeline.ingest_stream(
+            request.resolved_lines(),
+            fmt=format or request.format or "jsonl",
+            source=source or request.source or "stream",
+        )
     except IngestionError as exc:
         raise HTTPException(status_code=400, detail={"kind": "ingestion_error", "message": str(exc)})
 
